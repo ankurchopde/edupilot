@@ -1,0 +1,15 @@
+node_modules/
+.next/
+out/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and local artifacts
+*.log
+runtime-check.png
+.env.backup
+.env.*.backup
+tsconfig.tsbuildinfo
