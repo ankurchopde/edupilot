@@ -138,6 +138,8 @@ EduPilot follows a continuous learning cycle:
 
 **Team:** Ankur.1252100020
 
+**Contributor:** https://github.com/muleyradhikaa
+
 **Contact:**
 - ankur.1252100020@vit.edu
 - muleyradhikaa@gmail.com
