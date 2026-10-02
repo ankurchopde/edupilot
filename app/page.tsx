@@ -58,6 +58,7 @@ export default function Home() {
   const [attempts, setAttempts] = useState<Attempt[]>([]);
   const [view, setView] = useState<View>("home");
   const [hydrated, setHydrated] = useState(false);
+  const [cloudReady, setCloudReady] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [authUser, setAuthUser] = useState<{ id: string; email?: string; name?: string } | null>(null);
   const [storageMessage, setStorageMessage] = useState("");
@@ -85,25 +86,196 @@ export default function Home() {
   }, []);
   useEffect(() => {
     if (!authReady) return;
-    const saved = loadLocalState(authUser ? `edupilot-state:${authUser.id}` : "edupilot-state");
-    // Hydration is best-effort. The app shell renders independently so a browser storage failure cannot blank the app.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setProfile(saved.profile);
-    setAttempts(saved.attempts);
-    setLessonDone(saved.lessonDone);
-    setChatMessages(saved.chatMessages);
-    setRoadmapCache(saved.roadmapCache);
-    if (saved.warning) setStorageMessage(saved.warning);
-    setHydrated(true);
-  // authUser is intentionally read to select an isolated localStorage namespace.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+
+    let active = true;
+
+    async function loadState() {
+      setHydrated(false);
+      setCloudReady(false);
+
+      const storageKey = authUser
+        ? `edupilot-state:${authUser.id}`
+        : "edupilot-state";
+
+      const supabase = createSupabaseBrowserClient();
+
+      // Signed-in users load their saved state from Supabase.
+      if (authUser && supabase) {
+        const { data, error } = await supabase
+          .from("learner_states")
+          .select("state")
+          .eq("user_id", authUser.id)
+          .maybeSingle();
+
+        if (!active) return;
+
+        if (error) {
+          setStorageMessage(
+            "Cloud progress could not be loaded. Your browser-saved progress is available for this session."
+          );
+
+          const local = loadLocalState(storageKey);
+          setProfile(local.profile);
+          setAttempts(local.attempts);
+          setLessonDone(local.lessonDone);
+          setChatMessages(local.chatMessages);
+          setRoadmapCache(local.roadmapCache);
+          setHydrated(true);
+          return;
+        }
+
+        if (data?.state && isRecord(data.state)) {
+          const saved = data.state;
+
+          setProfile(safeProfile(saved.profile));
+          setAttempts(safeAttempts(saved.attempts));
+          setLessonDone(saved.lessonDone === true);
+          setChatMessages(normalizeChatMessages(saved.chatMessages));
+          setRoadmapCache(normalizeRoadmapCache(saved.roadmapCache));
+          setCloudReady(true);
+          setHydrated(true);
+          return;
+        }
+
+        // No cloud record exists yet. Migrate this user's local state,
+        // or their anonymous state if this is their first signed-in session.
+        let local = loadLocalState(storageKey);
+
+        const hasUserLocalState = (() => {
+          try {
+            return window.localStorage.getItem(storageKey) !== null;
+          } catch {
+            return false;
+          }
+        })();
+
+        if (!hasUserLocalState) {
+          local = loadLocalState("edupilot-state");
+        }
+
+        const initialState = {
+          profile: local.profile,
+          attempts: local.attempts,
+          lessonDone: local.lessonDone,
+          chatMessages: local.chatMessages,
+          roadmapCache: local.roadmapCache,
+        };
+
+        const { error: saveError } = await supabase
+          .from("learner_states")
+          .upsert(
+            {
+              user_id: authUser.id,
+              state: initialState,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: "user_id" }
+          );
+
+        if (!active) return;
+
+        if (saveError) {
+          setStorageMessage(
+            "Your progress was loaded, but could not yet be saved to your account."
+          );
+        } else {
+          setCloudReady(true);
+        }
+
+        setProfile(local.profile);
+        setAttempts(local.attempts);
+        setLessonDone(local.lessonDone);
+        setChatMessages(local.chatMessages);
+        setRoadmapCache(local.roadmapCache);
+        if (local.warning) setStorageMessage(local.warning);
+        setHydrated(true);
+        return;
+      }
+
+      // Anonymous or local-only mode.
+      const local = loadLocalState(storageKey);
+
+      if (!active) return;
+
+      setProfile(local.profile);
+      setAttempts(local.attempts);
+      setLessonDone(local.lessonDone);
+      setChatMessages(local.chatMessages);
+      setRoadmapCache(local.roadmapCache);
+      if (local.warning) setStorageMessage(local.warning);
+      setHydrated(true);
+    }
+
+    void loadState();
+
+    return () => {
+      active = false;
+    };
   }, [authReady, authUser?.id]);
+
   useEffect(() => {
     if (!hydrated) return;
-    const storageKey = authUser ? `edupilot-state:${authUser.id}` : "edupilot-state";
-    try { window.localStorage.setItem(storageKey, JSON.stringify({ profile, attempts, lessonDone, chatMessages, roadmapCache })); }
-    catch { window.setTimeout(() => setStorageMessage("Progress could not be saved in this browser. You can keep learning in this session."), 0); }
-  }, [profile, attempts, lessonDone, chatMessages, roadmapCache, hydrated, authUser]);
+
+    const storageKey = authUser
+      ? `edupilot-state:${authUser.id}`
+      : "edupilot-state";
+
+    const state = {
+      profile,
+      attempts,
+      lessonDone,
+      chatMessages,
+      roadmapCache,
+    };
+
+    // Keep a browser backup as well.
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(state));
+    } catch {
+      setStorageMessage(
+        "Progress could not be saved in this browser. You can keep learning in this session."
+      );
+    }
+
+    // Do not write to the cloud until the signed-in user's state
+    // has finished loading or migrating.
+    if (!authUser || !cloudReady) return;
+
+    const timeout = window.setTimeout(async () => {
+      const supabase = createSupabaseBrowserClient();
+      if (!supabase) return;
+
+      const { error } = await supabase
+        .from("learner_states")
+        .upsert(
+          {
+            user_id: authUser.id,
+            state,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "user_id" }
+        );
+
+      if (error) {
+        setStorageMessage(
+          "Your progress is saved in this browser, but the cloud save failed."
+        );
+      } else {
+        setStorageMessage("");
+      }
+    }, 1000);
+
+    return () => window.clearTimeout(timeout);
+  }, [
+    profile,
+    attempts,
+    lessonDone,
+    chatMessages,
+    roadmapCache,
+    hydrated,
+    cloudReady,
+    authUser?.id,
+  ]);
 
   const summary = useMemo(() => summarizeAttempts(attempts), [attempts]);
   const recommendations = useMemo(() => getRecommendations(attempts, topicNames), [attempts]);
@@ -144,7 +316,16 @@ export default function Home() {
   function openTopic(topicId: string) { setActiveTopicId(topicId); setPracticeText(""); setShowHint(false); setView("lesson"); }
   function openChatForTopic(topicId: string) { const selectedTopic = topicRecords.find((topic) => topic.id === topicId); if (!selectedTopic) return; setChatContext({ topic: selectedTopic.title, lessonTitle: `${selectedTopic.levelTitle} · ${selectedTopic.title}`, objective: selectedTopic.description }); setView("chat"); }
   async function signOut() { const supabase = createSupabaseBrowserClient(); if (supabase) await supabase.auth.signOut(); router.replace("/login"); }
-  function resetProgress() { try { window.localStorage.removeItem(authUser ? `edupilot-state:${authUser.id}` : "edupilot-state"); } catch { /* keep the current session usable */ } setProfile(emptyProfile); setAttempts([]); setLessonDone(false); setChatMessages([]); setRoadmapCache(undefined); setChatContext(undefined); setView("home"); flash("Your learning history was reset."); }
+  function resetProgress() {
+    setProfile(emptyProfile);
+    setAttempts([]);
+    setLessonDone(false);
+    setChatMessages([]);
+    setRoadmapCache(undefined);
+    setChatContext(undefined);
+    setView("home");
+    flash("Your learning history was reset.");
+  }
   const currentQuestion = assessment[assessmentIndex];
   void Roadmap;
 
@@ -159,10 +340,13 @@ export default function Home() {
         <button className={view === "chat" ? "active" : ""} onClick={() => { setChatContext(undefined); setView("chat"); }}><span>✦</span> AI Tutor</button>
         <button className={view === "review" ? "active" : ""} onClick={() => setView("review")}><span>⌁</span> Review center {recommendations.length > 0 && <i>{recommendations.length}</i>}</button>
       </nav>
-      <div className="sidebar-bottom"><button className="quiet-button" onClick={() => setView("settings")}><span>⚙</span> Preferences</button><div className="privacy-note"><span className="lock">⌑</span><p>Your progress stays in this browser. No paid AI service required.</p></div></div>
+      <div className="sidebar-bottom"><button className="quiet-button" onClick={() => setView("settings")}><span>⚙</span> Preferences</button><div className="privacy-note"><span className="lock">⌑</span><p>Your progress is saved to your account when signed in. No paid AI service required.</p></div></div>
     </aside>
     <main className="main-content">
-      <header className="topbar"><div className="breadcrumb">{view === "home" ? "Overview" : view === "onboarding" ? "Your setup" : view === "analytics" ? "Learning analytics" : view === "roadmap" ? "My roadmap" : view === "lesson" ? "My roadmap / Lesson" : view === "review" ? "Review center" : view === "settings" ? "Preferences" : view === "chat" ? "AI Tutor" : "Diagnostic"}</div><div className="top-actions"><span className="local-pill"><span className="dot" /> Local progress saved</span>{authUser && <button className="account-button" onClick={signOut} title="Sign out">{authUser.name || authUser.email || "Account"} · Sign out</button>}{assessed && <button className="icon-button" title="Start a new diagnostic" onClick={startAssessment}>↻</button>}</div></header>
+      <header className="topbar"><div className="breadcrumb">{view === "home" ? "Overview" : view === "onboarding" ? "Your setup" : view === "analytics" ? "Learning analytics" : view === "roadmap" ? "My roadmap" : view === "lesson" ? "My roadmap / Lesson" : view === "review" ? "Review center" : view === "settings" ? "Preferences" : view === "chat" ? "AI Tutor" : "Diagnostic"}</div><div className="top-actions"><span className="local-pill">
+  <span className="dot" />
+  {authUser ? "Account progress saved" : "Local progress saved"}
+</span>{authUser && <button className="account-button" onClick={signOut} title="Sign out">{authUser.name || authUser.email || "Account"} · Sign out</button>}{assessed && <button className="icon-button" title="Start a new diagnostic" onClick={startAssessment}>↻</button>}</div></header>
       {storageMessage && <div className="storage-notice" role="status"><span>ⓘ</span><p>{storageMessage}</p><button aria-label="Dismiss storage notice" onClick={() => setStorageMessage("")}>×</button></div>}
       {view === "home" && <Overview profile={profile} assessed={assessed} summary={summary} recommendations={recommendations} evidence={evidence} onStartAssessment={openOnboarding} onRoadmap={() => setView("roadmap")} onLesson={() => openTopic(recommendations[0]?.topicId || lesson.topicId)} lessonDone={lessonDone} />}
       {view === "onboarding" && <Onboarding profile={profile} updateProfile={updateProfile} onBegin={startAssessment} />}
@@ -245,10 +429,12 @@ function Chat({ profile, messages, setMessages, lessonContext, onClear }: { prof
     setLoading(false);
   }
   function quickAction(action: string) { const prefix = lessonContext ? `About ${lessonContext.topic}: ` : "About the AI curriculum: "; send(`${prefix}${action}.`); }
-  return <section className="page chat-page"><div className="chat-heading"><div><div className="eyebrow">PERSONAL AI TUTOR</div><h1>Ask, explore, understand.</h1><p className="lead">A patient Gemini-powered tutor for the EduPilot curriculum. It can explain ideas, work through examples, and quiz you without pretending to know more about your progress than you have shown.</p></div><button className="secondary-button" onClick={() => { if (window.confirm("Clear this saved tutor conversation?")) onClear(); }} disabled={!messages.length}>Clear conversation</button></div><div className="chat-shell"><div className="chat-toolbar"><div><strong>EduPilot AI Tutor</strong>{lessonContext && <span className="chat-context">Context: {lessonContext.lessonTitle}</span>}</div><span className="chat-scope">Saved in this browser</span></div><div className="chat-transcript" aria-live="polite">{!messages.length && <div className="chat-empty"><div className="chat-orb">✦</div><h2>What are you curious about?</h2><p>Ask a question about AI, a concept in your roadmap, or something you encountered while practicing.</p><div className="suggestion-grid">{suggestions.map((suggestion) => <button key={suggestion} onClick={() => quickAction(suggestion)}>{suggestion}<span>→</span></button>)}</div></div>}{messages.map((message) => <div className={`chat-message ${message.role}`} key={message.id}><div className="message-avatar">{message.role === "assistant" ? "E" : (profile.name || "Y").slice(0, 1).toUpperCase()}</div><div className="message-body"><span className="message-label">{message.role === "assistant" ? "EDUPILOT" : profile.name || "YOU"}</span><div className="message-content">{message.role === "assistant" ? <TutorMarkdown content={message.content} /> : <p className="plain-message">{message.content}</p>}</div></div></div>)}{loading && <div className="chat-message assistant"><div className="message-avatar">E</div><div className="message-body"><span className="message-label">EDUPILOT</span><div className="typing-indicator"><i /><i /><i /></div></div></div>}{error && <div className="chat-error" role="alert"><div><strong>Tutor unavailable</strong><p>{error} Your message is still in the composer.</p></div>{failedMessage && <button className="secondary-button" onClick={() => send(failedMessage)} disabled={loading}>Retry</button>}</div>}<div ref={(node) => { if (node) node.scrollIntoView({ block: "nearest" }); }} /></div><div className="chat-composer"><div className="quick-actions" aria-label="Tutor quick actions">{suggestions.map((suggestion) => <button key={suggestion} onClick={() => quickAction(suggestion)} disabled={loading}>{suggestion}</button>)}</div><form onSubmit={(event) => { event.preventDefault(); send(input); }}><textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask your AI tutor anything about the curriculum…" aria-label="Message the AI Tutor" rows={3} maxLength={1600} /><div className="composer-footer"><span>{input.length}/1600 · Gemini responses are supplemental, not proof of mastery.</span><button className="primary-button" type="submit" disabled={!input.trim() || loading}>{loading ? "Thinking…" : "Send message"}<span>→</span></button></div></form></div></div></section>;
+  return <section className="page chat-page"><div className="chat-heading"><div><div className="eyebrow">PERSONAL AI TUTOR</div><h1>Ask, explore, understand.</h1><p className="lead">A patient Gemini-powered tutor for the EduPilot curriculum. It can explain ideas, work through examples, and quiz you without pretending to know more about your progress than you have shown.</p></div><button className="secondary-button" onClick={() => { if (window.confirm("Clear this saved tutor conversation?")) onClear(); }} disabled={!messages.length}>Clear conversation</button></div><div className="chat-shell"><div className="chat-toolbar"><div><strong>EduPilot AI Tutor</strong>{lessonContext && <span className="chat-context">Context: {lessonContext.lessonTitle}</span>}</div><span className="chat-scope">
+  {authUser ? "Saved to your account" : "Saved in this browser"}
+</span></div><div className="chat-transcript" aria-live="polite">{!messages.length && <div className="chat-empty"><div className="chat-orb">✦</div><h2>What are you curious about?</h2><p>Ask a question about AI, a concept in your roadmap, or something you encountered while practicing.</p><div className="suggestion-grid">{suggestions.map((suggestion) => <button key={suggestion} onClick={() => quickAction(suggestion)}>{suggestion}<span>→</span></button>)}</div></div>}{messages.map((message) => <div className={`chat-message ${message.role}`} key={message.id}><div className="message-avatar">{message.role === "assistant" ? "E" : (profile.name || "Y").slice(0, 1).toUpperCase()}</div><div className="message-body"><span className="message-label">{message.role === "assistant" ? "EDUPILOT" : profile.name || "YOU"}</span><div className="message-content">{message.role === "assistant" ? <TutorMarkdown content={message.content} /> : <p className="plain-message">{message.content}</p>}</div></div></div>)}{loading && <div className="chat-message assistant"><div className="message-avatar">E</div><div className="message-body"><span className="message-label">EDUPILOT</span><div className="typing-indicator"><i /><i /><i /></div></div></div>}{error && <div className="chat-error" role="alert"><div><strong>Tutor unavailable</strong><p>{error} Your message is still in the composer.</p></div>{failedMessage && <button className="secondary-button" onClick={() => send(failedMessage)} disabled={loading}>Retry</button>}</div>}<div ref={(node) => { if (node) node.scrollIntoView({ block: "nearest" }); }} /></div><div className="chat-composer"><div className="quick-actions" aria-label="Tutor quick actions">{suggestions.map((suggestion) => <button key={suggestion} onClick={() => quickAction(suggestion)} disabled={loading}>{suggestion}</button>)}</div><form onSubmit={(event) => { event.preventDefault(); send(input); }}><textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask your AI tutor anything about the curriculum…" aria-label="Message the AI Tutor" rows={3} maxLength={1600} /><div className="composer-footer"><span>{input.length}/1600 · Gemini responses are supplemental, not proof of mastery.</span><button className="primary-button" type="submit" disabled={!input.trim() || loading}>{loading ? "Thinking…" : "Send message"}<span>→</span></button></div></form></div></div></section>;
 }
 function Review({ recommendations, onTopic, onRoadmap }: { recommendations: ReturnType<typeof getRecommendations>; onTopic: (topicId: string) => void; onRoadmap: () => void }) { return <section className="page narrow-page"><div className="eyebrow">REVIEW CENTER</div><h1>Small, reasoned next steps.</h1><p className="lead">Review is scheduled from your evidence—not from an arbitrary checklist. Each recommendation tells you why it appeared.</p>{recommendations.length ? <div className="recommendation-list">{recommendations.map((r, i) => <div className="recommendation" key={r.topicId}><div className="rec-number">0{i + 1}</div><div className="rec-body"><span className="eyebrow">{r.action}</span><h2>{r.title}</h2><p>{r.reason}</p><button className="text-button" onClick={() => onTopic(r.topicId)}>Start this next <span>→</span></button></div></div>)}</div> : <div className="empty-state compact"><div className="empty-icon">⌁</div><h2>No review queue yet.</h2><p>As you answer questions, EduPilot will surface uncertain topics and explain why they deserve your attention.</p><button className="secondary-button" onClick={onRoadmap}>Explore roadmap</button></div>}</section>; }
-function Settings({ profile, updateProfile, resetProgress }: { profile: Profile; updateProfile: (key: keyof Profile, value: string | string[]) => void; resetProgress: () => void }) { return <section className="page narrow-page"><div className="eyebrow">PREFERENCES</div><h1>Make the tutor feel like yours.</h1><p className="lead">These preferences shape recommendations and explanations. You can change them anytime.</p><div className="settings-card"><Field label="What should we call you?" value={profile.name} onChange={(v) => updateProfile("name", v)} placeholder="Your name" /><Field label="Your learning goal" value={profile.goal} onChange={(v) => updateProfile("goal", v)} placeholder="What would you like to build or understand?" /><label className="field-label">Explanation style<select value={profile.style} onChange={(e) => updateProfile("style", e.target.value)}><option>Everyday analogies</option><option>Simple language</option><option>Visual explanations</option><option>Step-by-step technical explanations</option><option>Practical examples</option></select></label><label className="field-label">Available study time<select value={profile.time} onChange={(e) => updateProfile("time", e.target.value)}><option>10–15 min</option><option>20–30 min</option><option>45–60 min</option><option>More than an hour</option></select></label></div><div className="danger-zone"><div><strong>Reset learning history</strong><p>Remove your profile, answers, lesson progress and analytics from this browser.</p></div><button className="danger-button" onClick={() => { if (window.confirm("Reset all EduPilot progress? This cannot be undone.")) resetProgress(); }}>Reset progress</button></div></section>; }
+function Settings({ profile, updateProfile, resetProgress }: { profile: Profile; updateProfile: (key: keyof Profile, value: string | string[]) => void; resetProgress: () => void }) { return <section className="page narrow-page"><div className="eyebrow">PREFERENCES</div><h1>Make the tutor feel like yours.</h1><p className="lead">These preferences shape recommendations and explanations. You can change them anytime.</p><div className="settings-card"><Field label="What should we call you?" value={profile.name} onChange={(v) => updateProfile("name", v)} placeholder="Your name" /><Field label="Your learning goal" value={profile.goal} onChange={(v) => updateProfile("goal", v)} placeholder="What would you like to build or understand?" /><label className="field-label">Explanation style<select value={profile.style} onChange={(e) => updateProfile("style", e.target.value)}><option>Everyday analogies</option><option>Simple language</option><option>Visual explanations</option><option>Step-by-step technical explanations</option><option>Practical examples</option></select></label><label className="field-label">Available study time<select value={profile.time} onChange={(e) => updateProfile("time", e.target.value)}><option>10–15 min</option><option>20–30 min</option><option>45–60 min</option><option>More than an hour</option></select></label></div><div className="danger-zone"><div><strong>Reset learning history</strong><p>Remove your profile, answers, lesson progress and analytics from your saved progress.</p></div><button className="danger-button" onClick={() => { if (window.confirm("Reset all EduPilot progress? This cannot be undone.")) resetProgress(); }}>Reset progress</button></div></section>; }
 function Field({ label, value, onChange, placeholder }: { label: string; value: string; onChange: (v: string) => void; placeholder: string }) { return <label className="field-label">{label}<input value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} /></label>; }
 
 function TopicLesson({ topicId, practiceText, setPracticeText, showHint, setShowHint, submitPractice, onBack, completed, onOpenChat }: { topicId: string; practiceText: string; setPracticeText: (v: string) => void; showHint: boolean; setShowHint: (v: boolean) => void; submitPractice: () => void; onBack: () => void; completed: boolean; onOpenChat: () => void }) {
